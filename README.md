@@ -16,9 +16,17 @@ label, using QuPath's built-in `ContourTracing`.
 
 It can also:
 - Sample mean intensity per channel per detection (so downstream tools like
-  FlowPath-GatingTree see populated measurements and can gate immediately)
+  FlowPath-GatingTree see populated measurements and can gate immediately).
+  Intensity is computed with the same bincount pass mirage uses in
+  `bin/quantify.py` — values are identical, and measurements are keyed by
+  bare channel name (`CD45`, `DAPI`), which is what GatingTree and qUMAP
+  read.
 - Add the detections straight into the current image's hierarchy
 - Save the result as QuPath-native GeoJSON (`FeatureCollection`)
+
+One detection is produced per unique integer label in the mask. Labels with
+multiple connected components are merged into a single detection, matching
+mirage's cell count.
 
 ## Two input modes
 

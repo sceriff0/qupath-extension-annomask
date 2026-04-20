@@ -6,7 +6,7 @@ plugins {
 qupathExtension {
     name = "FlowPath - AnnoMask"
     group = "io.github.qupath"
-    version = "0.1.0"
+    version = "0.2.0"
     description = "Convert TIFF segmentation masks to QuPath detection objects via GeoJSON."
     automaticModule = "qupath.ext.annomask"
 }

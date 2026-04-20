@@ -24,7 +24,8 @@ class MaskConverterTest {
         fillRect(data, w, 6, 6, 4, 4, 2);   // label 2 at x∈[6,9], y∈[6,9]
 
         SimpleImage band = SimpleImages.createFloatImage(data, w, h);
-        List<PathObject> detections = MaskConverter.convertFromSimpleImage(band, null);
+        List<PathObject> raw = MaskConverter.convertFromSimpleImage(band, null);
+        List<PathObject> detections = MaskConverter.mergeByLabel(raw);
 
         assertEquals(2, detections.size(), "expected one detection per label");
         var names = detections.stream().map(PathObject::getName).collect(Collectors.toSet());
@@ -39,8 +40,31 @@ class MaskConverterTest {
     @Test
     void emptyMaskProducesNoDetections() {
         SimpleImage band = SimpleImages.createFloatImage(new float[16], 4, 4);
-        List<PathObject> detections = MaskConverter.convertFromSimpleImage(band, null);
+        List<PathObject> detections = MaskConverter.mergeByLabel(
+                MaskConverter.convertFromSimpleImage(band, null));
         assertEquals(0, detections.size());
+    }
+
+    @Test
+    void disconnectedLabelMergesToSingleDetection() {
+        // 12x12 band with two 3x3 squares both labelled 5 (no touching).
+        int w = 12;
+        int h = 12;
+        float[] data = new float[w * h];
+        fillRect(data, w, 1, 1, 3, 3, 5);
+        fillRect(data, w, 7, 7, 3, 3, 5);
+
+        SimpleImage band = SimpleImages.createFloatImage(data, w, h);
+        List<PathObject> raw = MaskConverter.convertFromSimpleImage(band, null);
+        // ContourTracing reports two detections, one per component...
+        assertEquals(2, raw.size(), "precondition: two connected components before merge");
+
+        // ...but mergeByLabel collapses them back to one cell with a unioned ROI.
+        List<PathObject> merged = MaskConverter.mergeByLabel(raw);
+        assertEquals(1, merged.size(), "one detection per label ID after merge");
+        PathObject det = merged.get(0);
+        assertEquals("5", det.getName());
+        assertEquals(18.0, det.getROI().getArea(), 1e-6, "union area = 2 * 3 * 3");
     }
 
     private static void fillRect(float[] data, int w, int x0, int y0, int rw, int rh, int label) {

@@ -200,19 +200,21 @@ public class AnnoMaskPane extends BorderPane {
             @Override
             protected List<PathObject> call() throws Exception {
                 updateStatus("Tracing contours…");
-                List<PathObject> detections;
+                MaskConverter.MaskResult result;
                 if (finalChannelIndex != null) {
                     MaskValidator.Report report = MaskValidator.quickCheck(imageData.getServer(), finalChannelIndex);
                     if (!report.looksLikeLabels()) {
                         updateStatus("Warning: channel values don't look like integer labels. Continuing anyway.");
                     }
-                    detections = MaskConverter.convertChannel(imageData.getServer(), finalChannelIndex);
+                    result = MaskConverter.convertChannel(imageData.getServer(), finalChannelIndex);
                 } else {
-                    detections = MaskConverter.convert(finalFile.toPath(), imageData.getServer());
+                    result = MaskConverter.convert(finalFile.toPath(), imageData.getServer());
                 }
+                List<PathObject> detections = result.detections();
                 updateStatus("Traced " + detections.size() + " object(s).");
                 if (extractIntensity && !detections.isEmpty()) {
                     IntensityExtractor.extract(imageData.getServer(), detections,
+                            result.labelBand(), result.maxLabel(),
                             (done, total) -> updateStatus("Extracting intensities… " + done + " / " + total));
                 }
                 if (loadIntoImage && !detections.isEmpty()) {
