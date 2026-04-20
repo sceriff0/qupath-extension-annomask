@@ -27,9 +27,11 @@ import java.util.function.BiFunction;
  *   <li>a labeled channel of the currently open image (channel mode).</li>
  * </ul>
  * Each output detection carries its integer mask label as {@code PathObject.name}.
- * Labels with multiple connected components are merged into a single detection
- * (via {@link RoiTools#union}) so that the object count per label matches what
- * mirage's {@code quantify.py} reports.
+ * {@link ContourTracing} itself groups pixels by label ID — a disconnected
+ * label becomes a single detection with a multi-polygon ROI, matching mirage's
+ * one-cell-per-label-ID convention. {@link #mergeByLabel} is kept as a safety
+ * net for any future codepath that builds detections outside ContourTracing;
+ * on the current paths it is a no-op.
  */
 public final class MaskConverter {
 

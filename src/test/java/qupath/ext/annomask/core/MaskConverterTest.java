@@ -46,7 +46,7 @@ class MaskConverterTest {
     }
 
     @Test
-    void disconnectedLabelMergesToSingleDetection() {
+    void disconnectedLabelProducesSingleDetection() {
         // 12x12 band with two 3x3 squares both labelled 5 (no touching).
         int w = 12;
         int h = 12;
@@ -55,16 +55,17 @@ class MaskConverterTest {
         fillRect(data, w, 7, 7, 3, 3, 5);
 
         SimpleImage band = SimpleImages.createFloatImage(data, w, h);
-        List<PathObject> raw = MaskConverter.convertFromSimpleImage(band, null);
-        // ContourTracing reports two detections, one per component...
-        assertEquals(2, raw.size(), "precondition: two connected components before merge");
+        List<PathObject> detections = MaskConverter.mergeByLabel(
+                MaskConverter.convertFromSimpleImage(band, null));
 
-        // ...but mergeByLabel collapses them back to one cell with a unioned ROI.
-        List<PathObject> merged = MaskConverter.mergeByLabel(raw);
-        assertEquals(1, merged.size(), "one detection per label ID after merge");
-        PathObject det = merged.get(0);
+        // ContourTracing groups pixels by label ID even when the label is
+        // spatially disconnected, producing one multi-polygon detection.
+        // mergeByLabel is a safety net for any future codepath that doesn't
+        // go through ContourTracing — on this path it is a no-op.
+        assertEquals(1, detections.size(), "one detection per label ID");
+        PathObject det = detections.get(0);
         assertEquals("5", det.getName());
-        assertEquals(18.0, det.getROI().getArea(), 1e-6, "union area = 2 * 3 * 3");
+        assertEquals(18.0, det.getROI().getArea(), 1e-6, "combined area = 2 * 3 * 3");
     }
 
     private static void fillRect(float[] data, int w, int x0, int y0, int rw, int rh, int label) {
