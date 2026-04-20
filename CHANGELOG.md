@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.1
+
+### Fixed
+
+- `MaskConverterTest.disconnectedLabelMergesToSingleDetection` had a bogus
+  precondition (`raw.size() == 2`) based on the wrong assumption that QuPath's
+  `ContourTracing` returns one detection per connected component. It actually
+  groups pixels by label ID into a single multi-polygon detection, which is
+  the behaviour AnnoMask wants. Test renamed to
+  `disconnectedLabelProducesSingleDetection` with the correct end-state
+  assertions. `MaskConverter` Javadoc updated.
+- `MaskConverter.mergeByLabel` retained as a safety net for any future
+  codepath that builds detections outside `ContourTracing`; no-op on the
+  current paths.
+
+### Note
+
+0.2.0 was tagged but its Actions build failed on the above test, so the
+release page was created without a JAR attached. 0.2.1 is the first
+shipping build of the 0.2.x line.
+
 ## 0.2.0
 
 ### Breaking
