@@ -1,9 +1,19 @@
 name: Build and Release
 
+# Two ways in:
+#   1. workflow_dispatch — you type the version; the job tests main and ONLY
+#      creates the tag + release if tests pass (no dangling tags on failure).
+#   2. push of a v* tag — the original manual-tag path, still supported.
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, e.g. 0.2.2 (must match build.gradle.kts). Tag is created only if tests pass.'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -24,8 +34,52 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      # JavaFX needs a display + GTK/GL libs even for unit tests that construct
+      # controls. xvfb provides a virtual framebuffer so the real toolkit starts
+      # headlessly (preferred over Monocle, which has no JavaFX 25-matched build).
+      - name: Install headless display deps
+        run: sudo apt-get update && sudo apt-get install -y xvfb libgl1 libgtk-3-0
+
+      # Resolve the release tag from either the dispatch input or the pushed tag,
+      # normalizing so "0.2.2" and "v0.2.2" both yield tag "v0.2.2".
+      - name: Resolve release tag
+        id: rel
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RAW="${{ inputs.version }}"
+          else
+            RAW="${GITHUB_REF_NAME}"
+          fi
+          VER="${RAW#v}"
+          echo "tag=v${VER}" >> "$GITHUB_OUTPUT"
+          echo "ver=${VER}"  >> "$GITHUB_OUTPUT"
+          echo "Resolved release tag: v${VER}"
+
+      # Guard 1: the version being released must match build.gradle.kts, so the
+      # built JAR, the tag, and the catalog entry can never disagree.
+      - name: Verify version matches build.gradle.kts
+        run: |
+          FILE_VER=$(grep -E '^[[:space:]]*version = "' build.gradle.kts | head -1 | sed -E 's/.*version = "([^"]+)".*/\1/')
+          if [ "$FILE_VER" != "${{ steps.rel.outputs.ver }}" ]; then
+            echo "::error::Release version ${{ steps.rel.outputs.ver }} != build.gradle.kts version ${FILE_VER}. Bump build.gradle.kts and push to main first." >&2
+            exit 1
+          fi
+          echo "Version match: ${FILE_VER}"
+
+      # Guard 2 (dispatch only): refuse to clobber an existing tag.
+      - name: Ensure tag does not already exist
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/${{ steps.rel.outputs.tag }}" >/dev/null 2>&1; then
+            echo "::error::Tag ${{ steps.rel.outputs.tag }} already exists. Bump the version." >&2
+            exit 1
+          fi
+
+      # The gate: if tests fail, the job stops here and no tag is ever created.
       - name: Build and test
-        run: ./gradlew build
+        env:
+          FLOWPATH_FX_REQUIRED: "true"   # fail loudly if the xvfb display breaks
+        run: xvfb-run --auto-servernum ./gradlew build
 
       - name: Upload test results
         uses: dorny/test-reporter@v1
@@ -35,20 +89,28 @@ jobs:
           path: build/test-results/test/*.xml
           reporter: java-junit
 
+      # Tests passed (the step above would have failed the job otherwise). Create
+      # the tag now. Pushed with GITHUB_TOKEN, so it will NOT re-trigger this
+      # workflow (recursion prevention) — exactly what we want.
+      - name: Create and push tag
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.rel.outputs.tag }}" -m "AnnoMask ${{ steps.rel.outputs.tag }}"
+          git push origin "${{ steps.rel.outputs.tag }}"
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.rel.outputs.tag }}
           files: build/libs/*.jar
           generate_release_notes: true
-
-      - name: Extract version from tag
-        id: version
-        run: echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
 
       - name: Update catalog
         env:
           CATALOG_PAT: ${{ secrets.CATALOG_PAT }}
-          TAG: ${{ steps.version.outputs.tag }}
+          TAG: ${{ steps.rel.outputs.tag }}
         run: |
           if [ -z "$CATALOG_PAT" ]; then
             echo "::error::CATALOG_PAT secret is missing or empty — catalog was NOT updated for ${TAG}. Add/rotate it in repo Settings → Secrets and variables → Actions." >&2
