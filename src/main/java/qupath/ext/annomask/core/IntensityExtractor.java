@@ -41,6 +41,30 @@ public final class IntensityExtractor {
                                SimpleImage labelBand,
                                int maxLabel,
                                ProgressListener progress) throws IOException {
+        extract(server, detections, labelBand, null, maxLabel, progress);
+    }
+
+    /**
+     * Per-compartment intensity extraction. When {@code nucleusBand} is non-null
+     * each object gets, per channel, the bare whole-cell mean ({@code "<m>"}) plus
+     * the three compartment keys {@code "<m>: Cell: Mean"},
+     * {@code "<m>: Nucleus: Mean"} and {@code "<m>: Cytoplasm: Mean"}. Cytoplasm
+     * is cell − nucleus, keyed by the CELL label (see
+     * {@link LabelIntensity#meanPerCompartment}). These EXACT keys match mirage's
+     * combined cell export so flowpath / qUMAP consume AnnoMask output unchanged.
+     *
+     * <p>When {@code nucleusBand} is null this is identical to the whole-cell-only
+     * path: only the bare {@code "<m>"} key is written.</p>
+     *
+     * @param nucleusBand nucleus mask aligned to {@code labelBand}, or null for
+     *                    the single-mask (whole-cell-only) behaviour
+     */
+    public static void extract(ImageServer<BufferedImage> server,
+                               Collection<? extends PathObject> detections,
+                               SimpleImage labelBand,
+                               SimpleImage nucleusBand,
+                               int maxLabel,
+                               ProgressListener progress) throws IOException {
         if (detections == null || detections.isEmpty()) {
             return;
         }
@@ -52,29 +76,46 @@ public final class IntensityExtractor {
         // Read the full image once — every channel needed is in this raster.
         BufferedImage img = server.readRegion(RegionRequest.createInstance(server));
         int total = channels.size();
+        boolean compartments = nucleusBand != null;
 
         // One bincount pass per channel; collect all means before touching the
         // MeasurementLists so each detection can be opened once.
         String[] names = new String[total];
-        double[][] meansPerChannel = new double[total][];
+        double[][] cellMeans = new double[total][];
+        double[][] nucMeans = compartments ? new double[total][] : null;
+        double[][] cytoMeans = compartments ? new double[total][] : null;
         for (int c = 0; c < total; c++) {
             SimpleImage channelBand = ContourTracing.extractBand(img.getRaster(), c);
-            meansPerChannel[c] = LabelIntensity.meanPerLabel(labelBand, channelBand, maxLabel);
             names[c] = channels.get(c).getName();
+            if (compartments) {
+                LabelIntensity.CompartmentMeans cm =
+                        LabelIntensity.meanPerCompartment(labelBand, nucleusBand, channelBand, maxLabel);
+                cellMeans[c] = cm.cell();
+                nucMeans[c] = cm.nucleus();
+                cytoMeans[c] = cm.cytoplasm();
+            } else {
+                cellMeans[c] = LabelIntensity.meanPerLabel(labelBand, channelBand, maxLabel);
+            }
             if (progress != null) {
                 progress.update(c + 1, total);
             }
         }
 
-        // Write every channel's value into each detection's MeasurementList in
-        // a single try-with-resources — close() compacts the list for
+        // Write every channel's value into each object's MeasurementList in a
+        // single try-with-resources — close() compacts the list for
         // serialisation and must run after all puts.
         for (PathObject det : detections) {
             int label = parseLabel(det.getName());
             if (label <= 0 || label > maxLabel) continue;
             try (MeasurementList ml = det.getMeasurementList()) {
                 for (int c = 0; c < total; c++) {
-                    ml.put(names[c], meansPerChannel[c][label]);
+                    // Bare whole-cell-mean key preserved for backward compatibility.
+                    ml.put(names[c], cellMeans[c][label]);
+                    if (compartments) {
+                        ml.put(names[c] + ": Cell: Mean", cellMeans[c][label]);
+                        ml.put(names[c] + ": Nucleus: Mean", nucMeans[c][label]);
+                        ml.put(names[c] + ": Cytoplasm: Mean", cytoMeans[c][label]);
+                    }
                 }
             }
         }

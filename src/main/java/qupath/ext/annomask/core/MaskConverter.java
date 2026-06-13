@@ -117,6 +117,87 @@ public final class MaskConverter {
         return merged;
     }
 
+    /**
+     * Dual-mask mode (file). Reads a labeled cell mask and a labeled nucleus
+     * mask from disk and builds one {@link qupath.lib.objects.PathCellObject}
+     * per cell label (whole-cell ROI + paired nucleus ROI). The returned
+     * {@link MaskResult#labelBand} / {@link MaskResult#maxLabel} are the CELL
+     * mask's, so per-compartment intensity extraction keys by cell label.
+     */
+    public static MaskResult convertCells(Path cellMaskPath, Path nucleusMaskPath) throws IOException {
+        SimpleImage cellBand = readMaskBand(cellMaskPath);
+        SimpleImage nucleusBand = readMaskBand(nucleusMaskPath);
+        return convertCells(cellBand, nucleusBand,
+                RegionRequest.createInstance("annomask-cell-mask", 1.0, 0, 0,
+                        cellBand.getWidth(), cellBand.getHeight()));
+    }
+
+    /**
+     * Dual-mask mode (raster). Traces both bands, pairs each nucleus to the cell
+     * label it most overlaps (the same rule mirage uses — assignment by maximum
+     * overlap area), and emits a cell object per cell label. A cell with no
+     * overlapping nucleus becomes a cell object without a nucleus ROI.
+     *
+     * <p>A null {@code region} is treated as a full-band region at downsample 1.</p>
+     *
+     * @param cellBand    labeled whole-cell mask (one label ID per cell)
+     * @param nucleusBand labeled nucleus mask (label IDs need not match the cells)
+     */
+    public static MaskResult convertCells(SimpleImage cellBand, SimpleImage nucleusBand, RegionRequest region) {
+        RegionRequest effectiveRegion = region != null
+                ? region
+                : RegionRequest.createInstance("annomask-cell-mask", 1.0, 0, 0,
+                        cellBand.getWidth(), cellBand.getHeight());
+
+        // One ROI per cell label and one ROI per nucleus label.
+        Map<String, ROI> cellRois = roiByLabel(convertFromSimpleImage(cellBand, effectiveRegion));
+        Map<String, ROI> nucleusRois = roiByLabel(convertFromSimpleImage(nucleusBand, effectiveRegion));
+
+        // Pair each nucleus to the cell label it overlaps most (overlap area).
+        Map<String, ROI> nucleusForCell = new LinkedHashMap<>();
+        for (ROI nucRoi : nucleusRois.values()) {
+            String bestCell = null;
+            double bestOverlap = 0.0;
+            for (Map.Entry<String, ROI> ce : cellRois.entrySet()) {
+                double overlap = RoiTools.intersectionArea(ce.getValue(), nucRoi);
+                if (overlap > bestOverlap) {
+                    bestOverlap = overlap;
+                    bestCell = ce.getKey();
+                }
+            }
+            if (bestCell != null) {
+                // If two nuclei map to the same cell, keep the larger overlap by
+                // only replacing when this nucleus has not yet been beaten; the
+                // simplest stable rule is first-wins per cell with max overlap.
+                nucleusForCell.merge(bestCell, nucRoi, (existing, candidate) ->
+                        candidate.getArea() > existing.getArea() ? candidate : existing);
+            }
+        }
+
+        List<PathObject> cells = new ArrayList<>(cellRois.size());
+        for (Map.Entry<String, ROI> ce : cellRois.entrySet()) {
+            ROI nucRoi = nucleusForCell.get(ce.getKey());
+            PathObject cell = PathObjects.createCellObject(ce.getValue(), nucRoi);
+            cell.setName(ce.getKey());
+            cells.add(cell);
+        }
+
+        int maxLabel = LabelIntensity.maxLabel(cellBand);
+        return new MaskResult(cells, cellBand, maxLabel);
+    }
+
+    /**
+     * Collapses traced per-component detections into one ROI per label ID
+     * (via {@link #mergeByLabel}), preserving first-occurrence ordering.
+     */
+    private static Map<String, ROI> roiByLabel(List<PathObject> traced) {
+        Map<String, ROI> byLabel = new LinkedHashMap<>();
+        for (PathObject merged : mergeByLabel(traced)) {
+            byLabel.put(merged.getName(), merged.getROI());
+        }
+        return byLabel;
+    }
+
     private static SimpleImage readMaskBand(Path maskPath) throws IOException {
         // Open the mask file as its own server — it's a separate TIFF, not the
         // host image. ContourTracing.labelsToObjects did the same thing

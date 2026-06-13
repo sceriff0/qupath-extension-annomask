@@ -25,6 +25,7 @@ import javafx.stage.FileChooser;
 import qupath.ext.annomask.core.IntensityExtractor;
 import qupath.ext.annomask.core.MaskConverter;
 import qupath.ext.annomask.core.MaskValidator;
+import qupath.ext.annomask.core.ObjectReader;
 import qupath.ext.annomask.core.ObjectWriter;
 import qupath.lib.gui.QuPathGUI;
 import qupath.lib.gui.dialogs.Dialogs;
@@ -58,6 +59,7 @@ public class AnnoMaskPane extends BorderPane {
     private final CheckBox cbSave = new CheckBox("Also save GeoJSON to disk");
 
     private final Button runButton = new Button("Run Conversion");
+    private final Button importButton = new Button("Import GeoJSON…");
     private final Label statusLabel = new Label("Ready.");
     private final SimpleStringProperty statusProp = new SimpleStringProperty("Ready.");
     private final SimpleBooleanProperty running = new SimpleBooleanProperty(false);
@@ -102,13 +104,19 @@ public class AnnoMaskPane extends BorderPane {
 
         runButton.setPrefWidth(180);
         runButton.setDefaultButton(true);
+        importButton.setPrefWidth(180);
+        importButton.setTooltip(new Tooltip(
+                "Read QuPath-native GeoJSON (e.g. mirage's cells.geojson) into the current image, "
+                + "preserving nucleus geometry"));
         statusLabel.textProperty().bind(statusProp);
         statusLabel.setWrapText(true);
 
         VBox top = new VBox(10, sourcePane, outputPane);
         VBox.setVgrow(sourcePane, Priority.NEVER);
 
-        VBox bottom = new VBox(8, new Separator(), runButton, statusLabel);
+        HBox actionRow = new HBox(8, runButton, importButton);
+        actionRow.setAlignment(Pos.CENTER_LEFT);
+        VBox bottom = new VBox(8, new Separator(), actionRow, statusLabel);
         bottom.setAlignment(Pos.CENTER_LEFT);
         bottom.setPadding(new Insets(6, 0, 0, 0));
 
@@ -125,6 +133,8 @@ public class AnnoMaskPane extends BorderPane {
         });
         runButton.disableProperty().bind(running);
         runButton.setOnAction(e -> runConversion());
+        importButton.disableProperty().bind(running);
+        importButton.setOnAction(e -> importGeoJson());
     }
 
     private void chooseFile() {
@@ -243,6 +253,53 @@ public class AnnoMaskPane extends BorderPane {
         });
 
         Thread t = new Thread(task, "AnnoMask-worker");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private void importGeoJson() {
+        ImageData<BufferedImage> data = qupath.getImageData();
+        if (data == null) {
+            Dialogs.showErrorMessage("AnnoMask", "No image is currently open in QuPath.");
+            return;
+        }
+        FileChooser fc = new FileChooser();
+        fc.setTitle("Import GeoJSON");
+        fc.getExtensionFilters().add(new FileChooser.ExtensionFilter("GeoJSON", "*.geojson", "*.json"));
+        File source = fc.showOpenDialog(getScene().getWindow());
+        if (source == null) {
+            return;
+        }
+
+        final File finalSource = source;
+        final ImageData<BufferedImage> imageData = data;
+        Task<List<PathObject>> task = new Task<>() {
+            @Override
+            protected List<PathObject> call() throws Exception {
+                updateStatus("Reading GeoJSON…");
+                List<PathObject> objects = ObjectReader.readGeoJson(finalSource);
+                if (!objects.isEmpty()) {
+                    updateStatus("Loading " + objects.size() + " object(s) into hierarchy…");
+                    ObjectWriter.addToHierarchy(imageData, objects);
+                }
+                return objects;
+            }
+        };
+        task.setOnRunning(e -> running.set(true));
+        task.setOnSucceeded(e -> {
+            running.set(false);
+            List<PathObject> result = task.getValue();
+            statusProp.set("Imported " + (result == null ? 0 : result.size()) + " object(s).");
+        });
+        task.setOnFailed(e -> {
+            running.set(false);
+            Throwable ex = task.getException();
+            String msg = ex == null ? "(unknown)" : ex.getMessage();
+            statusProp.set("Error: " + msg);
+            Dialogs.showErrorMessage("AnnoMask", "Import failed: " + msg);
+        });
+
+        Thread t = new Thread(task, "AnnoMask-import");
         t.setDaemon(true);
         t.start();
     }
