@@ -49,8 +49,11 @@ jobs:
         env:
           CATALOG_PAT: ${{ secrets.CATALOG_PAT }}
           TAG: ${{ steps.version.outputs.tag }}
-        if: env.CATALOG_PAT != ''
         run: |
+          if [ -z "$CATALOG_PAT" ]; then
+            echo "::error::CATALOG_PAT secret is missing or empty — catalog was NOT updated for ${TAG}. Add/rotate it in repo Settings → Secrets and variables → Actions." >&2
+            exit 1
+          fi
           JAR_NAME=$(find build/libs -name '*.jar' ! -name '*-all.jar' ! -name '*-sources.jar' ! -name '*-javadoc.jar' -printf '%f' -quit)
           # GitHub normalizes spaces to dots in release asset filenames
           JAR_NAME="${JAR_NAME// /.}"
@@ -64,12 +67,14 @@ jobs:
           NEW_RELEASE=$(jq -n --arg name "$TAG" --arg url "$DOWNLOAD_URL" \
             '{name: $name, main_url: $url, version_range: {min: "v0.7.0"}}')
 
+          # Idempotent insert: skip if this version is already present (prevents duplicates)
           jq --arg ext "$EXTENSION_NAME" --argjson release "$NEW_RELEASE" \
-            '(.extensions[] | select(.name == $ext) | .releases) |= [$release] + .' \
+            '(.extensions[] | select(.name == $ext) | .releases) |= (if any(.[]; .name == $release.name) then . else [$release] + . end)' \
             catalog.json > catalog.tmp && mv catalog.tmp catalog.json
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add catalog.json
+          git diff --staged --quiet && { echo "Catalog already contains ${EXTENSION_NAME} ${TAG} — nothing to commit."; exit 0; }
           git commit -m "Add ${EXTENSION_NAME} ${TAG} to catalog"
           git push
