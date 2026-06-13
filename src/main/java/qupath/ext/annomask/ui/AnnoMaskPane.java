@@ -4,6 +4,8 @@ import javafx.application.Platform;
 import javafx.beans.property.SimpleBooleanProperty;
 import javafx.beans.property.SimpleObjectProperty;
 import javafx.beans.property.SimpleStringProperty;
+import javafx.beans.value.ChangeListener;
+import javafx.beans.value.WeakChangeListener;
 import javafx.concurrent.Task;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
@@ -11,6 +13,7 @@ import javafx.scene.control.Button;
 import javafx.scene.control.CheckBox;
 import javafx.scene.control.ComboBox;
 import javafx.scene.control.Label;
+import javafx.scene.control.ProgressBar;
 import javafx.scene.control.RadioButton;
 import javafx.scene.control.Separator;
 import javafx.scene.control.TitledPane;
@@ -21,6 +24,8 @@ import javafx.scene.layout.GridPane;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
 import javafx.scene.layout.VBox;
+import javafx.scene.input.Dragboard;
+import javafx.scene.input.TransferMode;
 import javafx.stage.FileChooser;
 import qupath.ext.annomask.core.IntensityExtractor;
 import qupath.ext.annomask.core.MaskConverter;
@@ -30,11 +35,13 @@ import qupath.ext.annomask.core.ObjectWriter;
 import qupath.lib.gui.QuPathGUI;
 import qupath.lib.gui.dialogs.Dialogs;
 import qupath.lib.images.ImageData;
+import qupath.lib.images.servers.ImageServer;
 import qupath.lib.objects.PathObject;
 
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Main AnnoMask UI. Lets the user pick a mask source (channel in the current
@@ -50,25 +57,46 @@ public class AnnoMaskPane extends BorderPane {
     private final RadioButton rbChannel = new RadioButton("Channel in current image");
     private final RadioButton rbFile = new RadioButton("Load from file");
     private final ComboBox<String> channelCombo = new ComboBox<>();
+    private final Label channelHint = new Label();
     private final Label fileLabel = new Label("(no file selected)");
     private final Button fileButton = new Button("Choose file…");
     private final SimpleObjectProperty<File> selectedFile = new SimpleObjectProperty<>();
+    /** Discards stale async channel-preview results when the selection changes fast. */
+    private final AtomicInteger previewToken = new AtomicInteger();
 
     private final CheckBox cbIntensity = new CheckBox("Extract channel intensities (needed for FlowPath gating)");
     private final CheckBox cbLoad = new CheckBox("Load into current image");
     private final CheckBox cbSave = new CheckBox("Also save GeoJSON to disk");
 
     private final Button runButton = new Button("Run Conversion");
+    private final Button cancelButton = new Button("Cancel");
     private final Button importButton = new Button("Import GeoJSON…");
     private final Label statusLabel = new Label("Ready.");
+    private final ProgressBar progressBar = new ProgressBar(0);
     private final SimpleStringProperty statusProp = new SimpleStringProperty("Ready.");
     private final SimpleBooleanProperty running = new SimpleBooleanProperty(false);
+
+    /** Remembers the last directory used in a file chooser, for convenience. */
+    private File lastDirectory;
+    /** The conversion/import task currently in flight, for cancellation. */
+    private Task<?> activeTask;
+
+    /**
+     * Listener kept as a field so the {@link WeakChangeListener} wrapping it
+     * stays alive exactly as long as this pane — when the pane is collected the
+     * listener detaches itself from QuPath's image property automatically.
+     */
+    private final ChangeListener<ImageData<BufferedImage>> imageListener =
+            (obs, oldData, newData) -> Platform.runLater(this::refreshChannels);
 
     public AnnoMaskPane(QuPathGUI qupath) {
         this.qupath = qupath;
         buildUi();
         wireEvents();
         refreshChannels();
+        // Keep the channel list in sync when the user switches images while the
+        // dialog stays open (the window is reused across invocations).
+        qupath.imageDataProperty().addListener(new WeakChangeListener<>(imageListener));
     }
 
     private void buildUi() {
@@ -87,16 +115,24 @@ public class AnnoMaskPane extends BorderPane {
         sourceGrid.add(rbChannel, 0, 0, 2, 1);
         sourceGrid.add(new Label("Channel:"), 0, 1);
         sourceGrid.add(channelCombo, 1, 1);
-        sourceGrid.add(rbFile, 0, 2, 2, 1);
+        channelHint.setWrapText(true);
+        channelHint.setStyle("-fx-font-size: 11px;");
+        sourceGrid.add(channelHint, 0, 2, 2, 1);
+        sourceGrid.add(rbFile, 0, 3, 2, 1);
         HBox fileRow = new HBox(6, fileButton, fileLabel);
         fileRow.setAlignment(Pos.CENTER_LEFT);
-        sourceGrid.add(fileRow, 0, 3, 2, 1);
+        sourceGrid.add(fileRow, 0, 4, 2, 1);
         TitledPane sourcePane = new TitledPane("Mask source", sourceGrid);
         sourcePane.setCollapsible(false);
 
         cbIntensity.setSelected(true);
+        cbIntensity.setTooltip(new Tooltip(
+                "Sample mean intensity per channel for each detection, keyed by bare channel "
+                + "name (DAPI, CD45). Required for FlowPath gating and qUMAP."));
         cbLoad.setSelected(true);
+        cbLoad.setTooltip(new Tooltip("Add the resulting detections to the current image's object hierarchy."));
         cbSave.setSelected(false);
+        cbSave.setTooltip(new Tooltip("Write the detections to a QuPath-native GeoJSON file as well."));
         VBox outputBox = new VBox(6, cbIntensity, cbLoad, cbSave);
         outputBox.setPadding(new Insets(6));
         TitledPane outputPane = new TitledPane("Output", outputBox);
@@ -104,6 +140,7 @@ public class AnnoMaskPane extends BorderPane {
 
         runButton.setPrefWidth(180);
         runButton.setDefaultButton(true);
+        cancelButton.setTooltip(new Tooltip("Stop the current run (results are discarded)."));
         importButton.setPrefWidth(180);
         importButton.setTooltip(new Tooltip(
                 "Read QuPath-native GeoJSON (e.g. mirage's cells.geojson) into the current image, "
@@ -111,12 +148,19 @@ public class AnnoMaskPane extends BorderPane {
         statusLabel.textProperty().bind(statusProp);
         statusLabel.setWrapText(true);
 
+        // Progress + cancel only take up space while a run is in flight.
+        progressBar.setMaxWidth(Double.MAX_VALUE);
+        progressBar.visibleProperty().bind(running);
+        progressBar.managedProperty().bind(running);
+        cancelButton.visibleProperty().bind(running);
+        cancelButton.managedProperty().bind(running);
+
         VBox top = new VBox(10, sourcePane, outputPane);
         VBox.setVgrow(sourcePane, Priority.NEVER);
 
-        HBox actionRow = new HBox(8, runButton, importButton);
+        HBox actionRow = new HBox(8, runButton, cancelButton, importButton);
         actionRow.setAlignment(Pos.CENTER_LEFT);
-        VBox bottom = new VBox(8, new Separator(), actionRow, statusLabel);
+        VBox bottom = new VBox(8, new Separator(), actionRow, progressBar, statusLabel);
         bottom.setAlignment(Pos.CENTER_LEFT);
         bottom.setPadding(new Insets(6, 0, 0, 0));
 
@@ -130,29 +174,165 @@ public class AnnoMaskPane extends BorderPane {
             boolean channelMode = newV == rbChannel;
             channelCombo.setDisable(!channelMode);
             fileButton.setDisable(channelMode);
+            refreshRunState();
+            previewChannel();
         });
-        runButton.disableProperty().bind(running);
+        channelCombo.getSelectionModel().selectedItemProperty().addListener((o, a, b) -> {
+            refreshRunState();
+            previewChannel();
+        });
+        selectedFile.addListener((o, a, b) -> refreshRunState());
+        running.addListener((o, a, b) -> refreshRunState());
         runButton.setOnAction(e -> runConversion());
+        cancelButton.setOnAction(e -> {
+            if (activeTask != null) {
+                activeTask.cancel(true);
+                statusProp.set("Cancelling…");
+            }
+        });
         importButton.disableProperty().bind(running);
         importButton.setOnAction(e -> importGeoJson());
+        enableDragAndDrop();
+        refreshRunState();
+    }
+
+    /**
+     * Accepts a dropped file: a {@code .geojson}/{@code .json} is imported into
+     * the hierarchy; a {@code .tif}/{@code .tiff} is loaded as the mask source
+     * (switching to file mode). Saves a trip through the file chooser.
+     */
+    private void enableDragAndDrop() {
+        setOnDragOver(e -> {
+            if (!running.get() && e.getDragboard().hasFiles()) {
+                e.acceptTransferModes(TransferMode.COPY);
+            }
+            e.consume();
+        });
+        setOnDragDropped(e -> {
+            Dragboard db = e.getDragboard();
+            boolean handled = false;
+            if (db.hasFiles() && !db.getFiles().isEmpty()) {
+                File f = db.getFiles().get(0);
+                String name = f.getName().toLowerCase();
+                if (name.endsWith(".geojson") || name.endsWith(".json")) {
+                    handled = true;
+                    importGeoJsonFile(f);
+                } else if (name.endsWith(".tif") || name.endsWith(".tiff")) {
+                    handled = true;
+                    rbFile.setSelected(true);
+                    selectedFile.set(f);
+                    fileLabel.setText(f.getName());
+                    fileLabel.setTooltip(new Tooltip(f.getAbsolutePath()));
+                    rememberDirectory(f);
+                    statusProp.set("Mask file set: " + f.getName());
+                }
+            }
+            e.setDropCompleted(handled);
+            e.consume();
+        });
+    }
+
+    /**
+     * Asynchronously checks whether the selected channel looks like an integer
+     * label mask and shows the verdict inline, so the user can catch a wrong
+     * channel before launching a long run. Runs off the FX thread; stale results
+     * are discarded via {@link #previewToken}.
+     */
+    private void previewChannel() {
+        if (!rbChannel.isSelected()) {
+            channelHint.setText("");
+            return;
+        }
+        ImageData<BufferedImage> data = qupath.getImageData();
+        int idx = channelCombo.getSelectionModel().getSelectedIndex();
+        if (data == null || idx < 0) {
+            channelHint.setText("");
+            return;
+        }
+        int token = previewToken.incrementAndGet();
+        channelHint.setText("Checking channel…");
+        Thread t = new Thread(() -> {
+            String msg;
+            try {
+                MaskValidator.Report r = MaskValidator.quickCheck(data.getServer(), idx);
+                if (r.looksLikeLabels()) {
+                    msg = "✓ Looks like labels (~" + r.getDistinctNonZero() + " distinct in sample)";
+                } else if (!r.isIntegerLike()) {
+                    msg = "⚠ Values aren't integers — looks like an intensity channel, not labels";
+                } else {
+                    msg = "⚠ No labels found in the sampled region";
+                }
+            } catch (Exception ex) {
+                msg = "";
+            }
+            final String result = msg;
+            Platform.runLater(() -> {
+                if (token == previewToken.get()) {
+                    channelHint.setText(result);
+                }
+            });
+        }, "AnnoMask-preview");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /**
+     * Enables Run only when the current selection can actually produce output,
+     * and — while idle — shows what is missing instead of letting the user click
+     * into an error dialog.
+     */
+    private void refreshRunState() {
+        String blocked = runBlockedReason(
+                qupath.getImageData() != null,
+                rbChannel.isSelected(),
+                channelCombo.getSelectionModel().getSelectedIndex() >= 0,
+                selectedFile.get() != null);
+        runButton.setDisable(running.get() || blocked != null);
+        if (!running.get()) {
+            statusProp.set(blocked != null ? blocked : "Ready.");
+        }
+    }
+
+    /**
+     * Pure check of whether a conversion can run. Returns a human-readable reason
+     * it is blocked, or {@code null} when the configuration is runnable. Package
+     * private so it can be unit-tested without a live {@code QuPathGUI}.
+     */
+    static String runBlockedReason(boolean hasImage, boolean channelMode,
+                                   boolean hasChannelSelected, boolean hasFile) {
+        if (!hasImage) {
+            return "Open an image in QuPath first.";
+        }
+        if (channelMode && !hasChannelSelected) {
+            return "Pick a channel to use as the label mask.";
+        }
+        if (!channelMode && !hasFile) {
+            return "Choose a labeled TIFF mask file.";
+        }
+        return null;
     }
 
     private void chooseFile() {
         FileChooser fc = new FileChooser();
         fc.setTitle("Select a labeled TIFF mask");
         fc.getExtensionFilters().add(new FileChooser.ExtensionFilter("TIFF mask", "*.tif", "*.tiff"));
+        applyInitialDirectory(fc);
         File f = fc.showOpenDialog(getScene().getWindow());
         if (f != null) {
             selectedFile.set(f);
             fileLabel.setText(f.getName());
+            fileLabel.setTooltip(new Tooltip(f.getAbsolutePath()));
+            rememberDirectory(f);
         }
     }
 
     private void refreshChannels() {
+        String previous = channelCombo.getSelectionModel().getSelectedItem();
         channelCombo.getItems().clear();
         ImageData<BufferedImage> data = qupath.getImageData();
         if (data == null) {
             channelCombo.setPlaceholder(new Label("(no image open)"));
+            refreshRunState();
             return;
         }
         var channels = data.getServer().getMetadata().getChannels();
@@ -160,8 +340,15 @@ public class AnnoMaskPane extends BorderPane {
             channelCombo.getItems().add(ch.getName());
         }
         if (!channelCombo.getItems().isEmpty()) {
-            channelCombo.getSelectionModel().select(0);
+            // Preserve the user's selection across an image swap when possible.
+            if (previous != null && channelCombo.getItems().contains(previous)) {
+                channelCombo.getSelectionModel().select(previous);
+            } else {
+                channelCombo.getSelectionModel().select(0);
+            }
         }
+        refreshRunState();
+        previewChannel();
     }
 
     private void runConversion() {
@@ -193,10 +380,12 @@ public class AnnoMaskPane extends BorderPane {
             fc.setTitle("Save GeoJSON");
             fc.getExtensionFilters().add(new FileChooser.ExtensionFilter("GeoJSON", "*.geojson", "*.json"));
             fc.setInitialFileName("annomask.geojson");
+            applyInitialDirectory(fc);
             savePath = fc.showSaveDialog(getScene().getWindow());
             if (savePath == null) {
                 return;
             }
+            rememberDirectory(savePath);
         }
 
         final Integer finalChannelIndex = channelIndex;
@@ -210,23 +399,18 @@ public class AnnoMaskPane extends BorderPane {
             @Override
             protected List<PathObject> call() throws Exception {
                 updateStatus("Tracing contours…");
-                MaskConverter.MaskResult result;
-                if (finalChannelIndex != null) {
-                    MaskValidator.Report report = MaskValidator.quickCheck(imageData.getServer(), finalChannelIndex);
-                    if (!report.looksLikeLabels()) {
-                        updateStatus("Warning: channel values don't look like integer labels. Continuing anyway.");
-                    }
-                    result = MaskConverter.convertChannel(imageData.getServer(), finalChannelIndex);
-                } else {
-                    result = MaskConverter.convert(finalFile.toPath(), imageData.getServer());
+                updateProgress(-1, 1);
+                IntensityExtractor.ProgressListener intensityProgress = (done, total) -> {
+                    updateProgress(done, total);
+                    updateStatus("Extracting intensities… " + done + " / " + total);
+                };
+                List<PathObject> detections = runPipeline(
+                        imageData, finalChannelIndex, finalFile, extractIntensity, intensityProgress);
+                if (isCancelled()) {
+                    // Stop before mutating the hierarchy or writing files.
+                    return detections;
                 }
-                List<PathObject> detections = result.detections();
-                updateStatus("Traced " + detections.size() + " object(s).");
-                if (extractIntensity && !detections.isEmpty()) {
-                    IntensityExtractor.extract(imageData.getServer(), detections,
-                            result.labelBand(), result.maxLabel(),
-                            (done, total) -> updateStatus("Extracting intensities… " + done + " / " + total));
-                }
+                updateProgress(-1, 1);
                 if (loadIntoImage && !detections.isEmpty()) {
                     updateStatus("Loading " + detections.size() + " detections into hierarchy…");
                     ObjectWriter.addToHierarchy(imageData, detections);
@@ -238,38 +422,119 @@ public class AnnoMaskPane extends BorderPane {
                 return detections;
             }
         };
+        progressBar.progressProperty().bind(task.progressProperty());
+        activeTask = task;
         task.setOnRunning(e -> running.set(true));
         task.setOnSucceeded(e -> {
-            running.set(false);
+            finishTask();
             List<PathObject> result = task.getValue();
-            statusProp.set("Done. " + (result == null ? 0 : result.size()) + " detection(s).");
+            int n = result == null ? 0 : result.size();
+            statusProp.set(task.isCancelled()
+                    ? "Cancelled (" + n + " detection(s) discarded)."
+                    : "Done. " + n + " detection(s).");
+        });
+        task.setOnCancelled(e -> {
+            finishTask();
+            statusProp.set("Cancelled.");
         });
         task.setOnFailed(e -> {
-            running.set(false);
+            finishTask();
             Throwable ex = task.getException();
             String msg = ex == null ? "(unknown)" : ex.getMessage();
             statusProp.set("Error: " + msg);
             Dialogs.showErrorMessage("AnnoMask", "Conversion failed: " + msg);
         });
 
-        Thread t = new Thread(task, "AnnoMask-worker");
-        t.setDaemon(true);
-        t.start();
+        startTask(task, "AnnoMask-worker");
+    }
+
+    /**
+     * Image size (in bytes, label band or full multi-channel read) above which
+     * the streamed tile-by-tile path is used instead of decoding the whole image.
+     */
+    private static final long STREAM_BUDGET_BYTES = 512L * 1024 * 1024;
+
+    /**
+     * Traces and (optionally) quantifies, choosing the in-memory path for normal
+     * images and the streamed tile-by-tile path for images too large to decode
+     * whole. Both paths produce identical detections and measurements.
+     */
+    private List<PathObject> runPipeline(ImageData<BufferedImage> imageData, Integer channelIndex,
+                                         File file, boolean extractIntensity,
+                                         IntensityExtractor.ProgressListener intensityProgress) throws Exception {
+        ImageServer<BufferedImage> server = imageData.getServer();
+        if (channelIndex != null) {
+            MaskValidator.Report report = MaskValidator.quickCheck(server, channelIndex);
+            if (!report.looksLikeLabels()) {
+                updateStatus("Warning: channel values don't look like integer labels. Continuing anyway.");
+            }
+        }
+
+        if (shouldStream(server)) {
+            updateStatus("Large image — streaming in tiles…");
+            try (MaskConverter.LabelSource labels = channelIndex != null
+                    ? MaskConverter.channelLabelSource(server, channelIndex)
+                    : MaskConverter.fileLabelSource(file.toPath())) {
+                MaskConverter.StreamedTrace st =
+                        MaskConverter.traceStreamed(labels, MaskConverter.DEFAULT_TILE_SIZE);
+                List<PathObject> detections = st.detections();
+                updateStatus("Traced " + detections.size() + " object(s).");
+                if (extractIntensity && !detections.isEmpty()) {
+                    IntensityExtractor.extractStreamed(server, detections, labels,
+                            st.maxLabel(), 0, intensityProgress);
+                }
+                return detections;
+            }
+        }
+
+        MaskConverter.MaskResult result = channelIndex != null
+                ? MaskConverter.convertChannel(server, channelIndex)
+                : MaskConverter.convert(file.toPath(), server);
+        List<PathObject> detections = result.detections();
+        updateStatus("Traced " + detections.size() + " object(s).");
+        if (extractIntensity && !detections.isEmpty()) {
+            IntensityExtractor.extract(server, detections, result.labelBand(), result.maxLabel(),
+                    result.sourceImage(), intensityProgress);
+        }
+        return detections;
+    }
+
+    /** True when decoding the whole image (or even one band) would be too large. */
+    private static boolean shouldStream(ImageServer<BufferedImage> server) {
+        long pixels = (long) server.getWidth() * server.getHeight();
+        long bandBytes = pixels * 4; // a single float label band
+        long bytesPerSample = Math.max(1, server.getPixelType().getBytesPerPixel());
+        long imageBytes = pixels * server.nChannels() * bytesPerSample;
+        return bandBytes > STREAM_BUDGET_BYTES || imageBytes > STREAM_BUDGET_BYTES;
     }
 
     private void importGeoJson() {
-        ImageData<BufferedImage> data = qupath.getImageData();
-        if (data == null) {
+        if (qupath.getImageData() == null) {
             Dialogs.showErrorMessage("AnnoMask", "No image is currently open in QuPath.");
             return;
         }
         FileChooser fc = new FileChooser();
         fc.setTitle("Import GeoJSON");
         fc.getExtensionFilters().add(new FileChooser.ExtensionFilter("GeoJSON", "*.geojson", "*.json"));
+        applyInitialDirectory(fc);
         File source = fc.showOpenDialog(getScene().getWindow());
         if (source == null) {
             return;
         }
+        importGeoJsonFile(source);
+    }
+
+    /** Reads {@code source} as GeoJSON and loads it into the current hierarchy. */
+    private void importGeoJsonFile(File source) {
+        ImageData<BufferedImage> data = qupath.getImageData();
+        if (data == null) {
+            Dialogs.showErrorMessage("AnnoMask", "No image is currently open in QuPath.");
+            return;
+        }
+        if (running.get()) {
+            return;
+        }
+        rememberDirectory(source);
 
         final File finalSource = source;
         final ImageData<BufferedImage> imageData = data;
@@ -277,7 +542,11 @@ public class AnnoMaskPane extends BorderPane {
             @Override
             protected List<PathObject> call() throws Exception {
                 updateStatus("Reading GeoJSON…");
+                updateProgress(-1, 1);
                 List<PathObject> objects = ObjectReader.readGeoJson(finalSource);
+                if (isCancelled()) {
+                    return objects;
+                }
                 if (!objects.isEmpty()) {
                     updateStatus("Loading " + objects.size() + " object(s) into hierarchy…");
                     ObjectWriter.addToHierarchy(imageData, objects);
@@ -285,23 +554,51 @@ public class AnnoMaskPane extends BorderPane {
                 return objects;
             }
         };
+        activeTask = task;
         task.setOnRunning(e -> running.set(true));
         task.setOnSucceeded(e -> {
-            running.set(false);
+            finishTask();
             List<PathObject> result = task.getValue();
             statusProp.set("Imported " + (result == null ? 0 : result.size()) + " object(s).");
         });
+        task.setOnCancelled(e -> {
+            finishTask();
+            statusProp.set("Cancelled.");
+        });
         task.setOnFailed(e -> {
-            running.set(false);
+            finishTask();
             Throwable ex = task.getException();
             String msg = ex == null ? "(unknown)" : ex.getMessage();
             statusProp.set("Error: " + msg);
             Dialogs.showErrorMessage("AnnoMask", "Import failed: " + msg);
         });
 
-        Thread t = new Thread(task, "AnnoMask-import");
+        startTask(task, "AnnoMask-import");
+    }
+
+    private void startTask(Task<?> task, String threadName) {
+        Thread t = new Thread(task, threadName);
         t.setDaemon(true);
         t.start();
+    }
+
+    private void finishTask() {
+        running.set(false);
+        progressBar.progressProperty().unbind();
+        progressBar.setProgress(0);
+        activeTask = null;
+    }
+
+    private void applyInitialDirectory(FileChooser fc) {
+        if (lastDirectory != null && lastDirectory.isDirectory()) {
+            fc.setInitialDirectory(lastDirectory);
+        }
+    }
+
+    private void rememberDirectory(File file) {
+        if (file != null && file.getParentFile() != null) {
+            lastDirectory = file.getParentFile();
+        }
     }
 
     private void updateStatus(String msg) {

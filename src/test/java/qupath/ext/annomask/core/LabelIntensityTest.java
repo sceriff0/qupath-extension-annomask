@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Test;
 import qupath.lib.analysis.images.SimpleImage;
 import qupath.lib.analysis.images.SimpleImages;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
@@ -80,5 +81,28 @@ class LabelIntensityTest {
         SimpleImage channel = SimpleImages.createFloatImage(new float[]{1, 2, 3, 4}, 2, 2);
         assertThrows(IllegalArgumentException.class,
                 () -> LabelIntensity.meanPerLabel(mask, channel, 2));
+    }
+
+    @Test
+    void flatArrayOverloadMatchesSimpleImageOverload() {
+        // The flat-array hot path must be numerically identical to the
+        // SimpleImage path it backs — same row-major order, same result.
+        float[] mask = {1, 1, 0, 1, 0, 2, 0, 2, 2};
+        float[] channel = {10, 20, 0, 30, 0, 40, 0, 50, 60};
+        SimpleImage maskImg = SimpleImages.createFloatImage(mask, 3, 3);
+        SimpleImage channelImg = SimpleImages.createFloatImage(channel, 3, 3);
+
+        double[] viaImage = LabelIntensity.meanPerLabel(maskImg, channelImg, 2);
+        double[] viaFlat = LabelIntensity.meanPerLabel(mask, channel, 2);
+
+        assertArrayEquals(viaImage, viaFlat, 0.0, "flat path must be bit-identical to image path");
+        assertEquals(20.0, viaFlat[1], 1e-12);
+        assertEquals(50.0, viaFlat[2], 1e-12);
+    }
+
+    @Test
+    void flatArrayOverloadRejectsLengthMismatch() {
+        assertThrows(IllegalArgumentException.class,
+                () -> LabelIntensity.meanPerLabel(new float[]{1, 2}, new float[]{1, 2, 3}, 2));
     }
 }

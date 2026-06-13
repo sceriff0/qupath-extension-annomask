@@ -10,9 +10,21 @@ import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class MaskConverterTest {
+
+    @Test
+    void checkLabelRangeRejectsImplausiblyLargeMax() {
+        // A raw intensity channel selected by mistake yields a huge "max label".
+        assertThrows(IllegalArgumentException.class,
+                () -> MaskConverter.checkLabelRange(MaskConverter.MAX_REASONABLE_LABEL + 1));
+        // Real cell counts pass through unchanged.
+        assertEquals(2, MaskConverter.checkLabelRange(2));
+        assertEquals(MaskConverter.MAX_REASONABLE_LABEL,
+                MaskConverter.checkLabelRange(MaskConverter.MAX_REASONABLE_LABEL));
+    }
 
     @Test
     void twoLabelsProduceTwoDetectionsWithCorrectNames() {

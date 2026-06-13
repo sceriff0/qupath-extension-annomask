@@ -35,6 +35,15 @@ import java.util.function.BiFunction;
  */
 public final class MaskConverter {
 
+    /**
+     * Upper bound on a plausible label ID. Intensity sizing allocates arrays of
+     * {@code maxLabel + 1} per channel, so a runaway max (typically from picking
+     * a raw intensity channel instead of the label channel) would otherwise
+     * exhaust memory. Tens of millions of objects is already far beyond any real
+     * segmentation; past this we fail with an actionable message instead.
+     */
+    static final int MAX_REASONABLE_LABEL = 50_000_000;
+
     private static final BiFunction<ROI, Number, PathObject> DETECTION_FACTORY = (roi, label) -> {
         PathObject det = PathObjects.createDetectionObject(roi);
         det.setName(String.valueOf(label.intValue()));
@@ -42,6 +51,20 @@ public final class MaskConverter {
     };
 
     private MaskConverter() {}
+
+    /**
+     * Rejects label ranges so large they would blow up intensity allocation,
+     * with a message pointing at the usual cause (a non-label channel selected).
+     */
+    static int checkLabelRange(int maxLabel) {
+        if (maxLabel > MAX_REASONABLE_LABEL) {
+            throw new IllegalArgumentException(
+                    "Maximum label value " + maxLabel + " is implausibly large for a segmentation "
+                    + "mask (limit " + MAX_REASONABLE_LABEL + "). This usually means a raw intensity "
+                    + "channel was selected instead of the integer label channel/mask.");
+        }
+        return maxLabel;
+    }
 
     /**
      * File mode. Reads the labeled TIFF at {@code maskPath} and returns one
@@ -52,7 +75,7 @@ public final class MaskConverter {
         RegionRequest region = RegionRequest.createInstance(server);
         List<PathObject> raw = ContourTracing.labelsToObjects(maskPath, region, DETECTION_FACTORY);
         SimpleImage labelBand = readMaskBand(maskPath);
-        int maxLabel = LabelIntensity.maxLabel(labelBand);
+        int maxLabel = checkLabelRange(LabelIntensity.maxLabel(labelBand));
         return new MaskResult(mergeByLabel(raw), labelBand, maxLabel);
     }
 
@@ -66,8 +89,10 @@ public final class MaskConverter {
         BufferedImage img = server.readRegion(region);
         SimpleImage band = ContourTracing.extractBand(img.getRaster(), channelIndex);
         List<PathObject> raw = convertFromSimpleImage(band, region);
-        int maxLabel = LabelIntensity.maxLabel(band);
-        return new MaskResult(mergeByLabel(raw), band, maxLabel);
+        int maxLabel = checkLabelRange(LabelIntensity.maxLabel(band));
+        // The host image is already decoded here; hand it to intensity extraction
+        // so it does not read the whole image a second time.
+        return new MaskResult(mergeByLabel(raw), band, maxLabel, img);
     }
 
     /**
@@ -182,7 +207,7 @@ public final class MaskConverter {
             cells.add(cell);
         }
 
-        int maxLabel = LabelIntensity.maxLabel(cellBand);
+        int maxLabel = checkLabelRange(LabelIntensity.maxLabel(cellBand));
         return new MaskResult(cells, cellBand, maxLabel);
     }
 
@@ -196,6 +221,106 @@ public final class MaskConverter {
             byLabel.put(merged.getName(), merged.getROI());
         }
         return byLabel;
+    }
+
+    // ------------------------------------------------------------------
+    // Streamed (tiled) path — for images too large to hold a full label band.
+    // ------------------------------------------------------------------
+
+    /** Default tile/strip edge for streamed tracing and quantification. */
+    public static final int DEFAULT_TILE_SIZE = 4096;
+
+    /**
+     * A source of label pixels that can be read one region at a time, so a mask
+     * larger than memory is never fully materialised. Backed either by a channel
+     * of the host image or by a separate mask file.
+     */
+    public interface LabelSource extends AutoCloseable {
+        int getWidth();
+        int getHeight();
+        /** Label band for the given region (top-left {@code x,y}, size {@code w×h}). */
+        SimpleImage readTile(int x, int y, int w, int h) throws IOException;
+        @Override default void close() throws IOException {}
+    }
+
+    /** Label source backed by one channel of an already-open server (channel mode). */
+    public static LabelSource channelLabelSource(ImageServer<BufferedImage> server, int channelIndex) {
+        return new LabelSource() {
+            @Override public int getWidth() { return server.getWidth(); }
+            @Override public int getHeight() { return server.getHeight(); }
+            @Override public SimpleImage readTile(int x, int y, int w, int h) throws IOException {
+                return ContourTracing.extractBand(server.readRegion(1.0, x, y, w, h).getRaster(), channelIndex);
+            }
+        };
+    }
+
+    /**
+     * Label source backed by a mask file on disk (file mode). Opens its own
+     * server, which {@link LabelSource#close()} releases — use try-with-resources.
+     */
+    public static LabelSource fileLabelSource(Path maskPath) throws IOException {
+        final ImageServer<BufferedImage> maskServer;
+        try {
+            maskServer = ImageServerProvider.buildServer(maskPath.toUri().toString(), BufferedImage.class);
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException("Failed to open mask file " + maskPath, e);
+        }
+        return new LabelSource() {
+            @Override public int getWidth() { return maskServer.getWidth(); }
+            @Override public int getHeight() { return maskServer.getHeight(); }
+            @Override public SimpleImage readTile(int x, int y, int w, int h) throws IOException {
+                return ContourTracing.extractBand(maskServer.readRegion(1.0, x, y, w, h).getRaster(), 0);
+            }
+            @Override public void close() throws IOException {
+                try {
+                    maskServer.close();
+                } catch (IOException e) {
+                    throw e;
+                } catch (Exception e) {
+                    throw new IOException("Failed to close mask server", e);
+                }
+            }
+        };
+    }
+
+    /** Detections from a streamed trace plus the largest label seen. */
+    public record StreamedTrace(List<PathObject> detections, int maxLabel) {}
+
+    /**
+     * Traces a label mask tile-by-tile and merges per label across tiles, so the
+     * whole band is never held in memory. Each tile is traced in its own
+     * coordinate frame (the {@link RegionRequest} offset places the ROIs in
+     * global image space); {@link #mergeByLabel} then unions the components of
+     * each label ID — including those split by a tile seam — into one detection.
+     * Because every label ID is globally unique in a mask, this reproduces the
+     * one-detection-per-label result of a whole-image trace.
+     *
+     * @param tileSize tile edge in pixels; {@link #DEFAULT_TILE_SIZE} is typical
+     */
+    public static StreamedTrace traceStreamed(LabelSource labels, int tileSize) throws IOException {
+        if (tileSize <= 0) {
+            throw new IllegalArgumentException("tileSize must be positive: " + tileSize);
+        }
+        int width = labels.getWidth();
+        int height = labels.getHeight();
+        List<PathObject> all = new ArrayList<>();
+        int maxLabel = 0;
+        for (int y = 0; y < height; y += tileSize) {
+            int th = Math.min(tileSize, height - y);
+            for (int x = 0; x < width; x += tileSize) {
+                int tw = Math.min(tileSize, width - x);
+                SimpleImage tile = labels.readTile(x, y, tw, th);
+                int m = LabelIntensity.maxLabel(tile);
+                if (m > maxLabel) {
+                    maxLabel = m;
+                }
+                RegionRequest region = RegionRequest.createInstance("annomask-stream", 1.0, x, y, tw, th);
+                all.addAll(ContourTracing.createObjects(tile, region, 1, -1, DETECTION_FACTORY));
+            }
+        }
+        return new StreamedTrace(mergeByLabel(all), checkLabelRange(maxLabel));
     }
 
     private static SimpleImage readMaskBand(Path maskPath) throws IOException {
@@ -214,6 +339,20 @@ public final class MaskConverter {
         }
     }
 
-    /** Bundle of a traced mask and the raster it was traced from. */
-    public record MaskResult(List<PathObject> detections, SimpleImage labelBand, int maxLabel) {}
+    /**
+     * Bundle of a traced mask and the raster it was traced from.
+     *
+     * <p>{@code sourceImage} is the already-decoded host image when the label
+     * came from one of its own channels (channel mode), so intensity extraction
+     * can reuse it instead of decoding the whole image a second time. It is
+     * {@code null} in file/dual-mask modes, where the channels live in a
+     * different image than the mask.</p>
+     */
+    public record MaskResult(List<PathObject> detections, SimpleImage labelBand, int maxLabel,
+                             BufferedImage sourceImage) {
+        /** Convenience constructor for modes with no reusable source image. */
+        public MaskResult(List<PathObject> detections, SimpleImage labelBand, int maxLabel) {
+            this(detections, labelBand, maxLabel, null);
+        }
+    }
 }

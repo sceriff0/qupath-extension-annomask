@@ -12,8 +12,13 @@ import java.util.Set;
 /**
  * Quick sanity check on a channel before treating it as a labeled mask.
  * Samples a small centre tile and reports whether the values look like
- * integer labels (no fractional parts, at least two distinct non-zero labels).
- * Reports are advisory — the UI warns but does not block conversion.
+ * integer labels (≥99% of sampled pixels are whole numbers) and carry at least
+ * one distinct non-zero label. Reports are advisory — the UI warns but does not
+ * block conversion.
+ *
+ * <p>Note: only a centre tile is sampled, so a mask whose objects avoid the
+ * image centre can produce a false "doesn't look like labels" warning. The
+ * warning is informational and never blocks the run.</p>
  */
 public final class MaskValidator {
 
@@ -54,6 +59,8 @@ public final class MaskValidator {
             }
         }
         boolean integerLike = samples > 0 && (integerSamples / (double) samples) >= 0.99;
+        // At least one distinct non-zero label in the sampled tile. (Kept at 1,
+        // not 2, so a legitimately single-object crop is not flagged.)
         boolean hasEnoughLabels = distinct.size() >= 1;
         return new Report(integerLike, hasEnoughLabels, distinct.size());
     }
