@@ -55,6 +55,32 @@ jobs:
           echo "ver=${VER}"  >> "$GITHUB_OUTPUT"
           echo "Resolved release tag: v${VER}"
 
+      # Guard 0: the catalog secret MUST exist, or the entire release is refused
+      # BEFORE anything is built, tagged, or published. A missing secret used to
+      # surface only at the final "Update catalog" step — after the release was
+      # already out — so the catalog could silently fall behind. Fail fast here.
+      #   workflow_dispatch: the tag is created later in this job, so failing now
+      #     means no tag is ever created.
+      #   tag push: the tag already exists (it triggered this run); delete it so a
+      #     missing secret leaves no dangling tag on an unreleased commit.
+      # (secrets cannot be read in step `if:`, so the check lives in the script.)
+      - name: Require CATALOG_PAT secret
+        env:
+          CATALOG_PAT: ${{ secrets.CATALOG_PAT }}
+          TAG: ${{ steps.rel.outputs.tag }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ -n "$CATALOG_PAT" ]; then
+            echo "CATALOG_PAT is configured — release may proceed."
+            exit 0
+          fi
+          echo "::error::CATALOG_PAT secret is missing or empty. Refusing to tag or release ${TAG} so the catalog can never fall out of sync. Add it in Settings → Secrets and variables → Actions, then re-run." >&2
+          if [ "$EVENT_NAME" = "push" ]; then
+            echo "Tag ${TAG} was pushed without a configured catalog secret — deleting it so the tag does not take effect." >&2
+            git push --delete origin "$TAG" || echo "::warning::Could not delete tag ${TAG}; please remove it manually."
+          fi
+          exit 1
+
       # Guard 1: the version being released must match build.gradle.kts, so the
       # built JAR, the tag, and the catalog entry can never disagree.
       - name: Verify version matches build.gradle.kts
