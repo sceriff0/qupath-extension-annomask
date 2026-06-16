@@ -79,22 +79,36 @@ jobs:
             fi
             exit 1
           fi
-          # The secret being non-empty is NOT enough: a read-only PAT clones fine
-          # but fails at the final push with 403, after the release is already out
-          # (this exact failure left the catalog one release behind on every repo).
-          # Probe actual write capability via the API before building anything.
-          RESP=$(curl -sSL -H "Authorization: Bearer $CATALOG_PAT" -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/sceriff0/flowpath-catalog)
-          PUSH=$(printf '%s' "$RESP" | jq -r '.permissions.push // false' 2>/dev/null || echo false)
-          if [ "$PUSH" != "true" ]; then
-            echo "::error::CATALOG_PAT cannot WRITE to sceriff0/flowpath-catalog (permissions.push=${PUSH}). Grant 'Contents: Read and write' on that repo (fine-grained PAT) or 'repo' scope (classic), then re-run." >&2
+          # Non-empty is NOT enough. The REST `.permissions` field reports the
+          # repo OWNER's role, not a fine-grained token's actual grant, so it
+          # false-positives for a read-only PAT (observed: probe says push=true,
+          # the real git push still 403s). The only reliable preflight is an
+          # actual write: create a throwaway ref with the token, then delete it.
+          API="https://api.github.com/repos/sceriff0/flowpath-catalog"
+          AUTH=(-H "Authorization: Bearer $CATALOG_PAT" -H "Accept: application/vnd.github+json")
+          SHA=$(curl -sSL "${AUTH[@]}" "$API/git/ref/heads/main" | jq -r '.object.sha // empty')
+          WRITABLE=no
+          if [ -z "$SHA" ]; then
+            echo "::error::CATALOG_PAT cannot read sceriff0/flowpath-catalog (token invalid or has no access to the repo). Fix the secret, then re-run." >&2
+          else
+            CHECK="catalog-pat-writecheck-${GITHUB_RUN_ID}"
+            CODE=$(curl -sS -o /dev/null -w '%{http_code}' "${AUTH[@]}" -X POST "$API/git/refs" \
+              -d "{\"ref\":\"refs/heads/${CHECK}\",\"sha\":\"${SHA}\"}")
+            if [ "$CODE" = "201" ]; then
+              curl -sS "${AUTH[@]}" -X DELETE "$API/git/refs/heads/${CHECK}" >/dev/null || true
+              WRITABLE=yes
+            else
+              echo "::error::CATALOG_PAT cannot WRITE to sceriff0/flowpath-catalog (test ref-create returned HTTP ${CODE}). Grant 'Contents: Read and write' on that repo (fine-grained PAT) or 'repo' scope (classic), then re-run." >&2
+            fi
+          fi
+          if [ "$WRITABLE" != "yes" ]; then
             if [ "$EVENT_NAME" = "push" ]; then
-              echo "Deleting tag ${TAG} so a read-only secret leaves no dangling tag on an unreleased commit." >&2
+              echo "Deleting tag ${TAG} so an unwritable secret leaves no dangling tag on an unreleased commit." >&2
               git push --delete origin "$TAG" || echo "::warning::Could not delete tag ${TAG}; please remove it manually."
             fi
             exit 1
           fi
-          echo "CATALOG_PAT is configured and can write to the catalog — release may proceed."
+          echo "CATALOG_PAT verified writable on the catalog — release may proceed."
 
       # Guard 1: the version being released must match build.gradle.kts, so the
       # built JAR, the tag, and the catalog entry can never disagree.
