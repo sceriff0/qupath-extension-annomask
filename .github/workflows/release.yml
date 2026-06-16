@@ -70,16 +70,31 @@ jobs:
           TAG: ${{ steps.rel.outputs.tag }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
-          if [ -n "$CATALOG_PAT" ]; then
-            echo "CATALOG_PAT is configured — release may proceed."
-            exit 0
+          # Refuse if the secret is missing/empty.
+          if [ -z "$CATALOG_PAT" ]; then
+            echo "::error::CATALOG_PAT secret is missing or empty. Refusing to tag or release ${TAG} so the catalog can never fall out of sync. Add it in Settings → Secrets and variables → Actions, then re-run." >&2
+            if [ "$EVENT_NAME" = "push" ]; then
+              echo "Tag ${TAG} was pushed without a configured catalog secret — deleting it so the tag does not take effect." >&2
+              git push --delete origin "$TAG" || echo "::warning::Could not delete tag ${TAG}; please remove it manually."
+            fi
+            exit 1
           fi
-          echo "::error::CATALOG_PAT secret is missing or empty. Refusing to tag or release ${TAG} so the catalog can never fall out of sync. Add it in Settings → Secrets and variables → Actions, then re-run." >&2
-          if [ "$EVENT_NAME" = "push" ]; then
-            echo "Tag ${TAG} was pushed without a configured catalog secret — deleting it so the tag does not take effect." >&2
-            git push --delete origin "$TAG" || echo "::warning::Could not delete tag ${TAG}; please remove it manually."
+          # The secret being non-empty is NOT enough: a read-only PAT clones fine
+          # but fails at the final push with 403, after the release is already out
+          # (this exact failure left the catalog one release behind on every repo).
+          # Probe actual write capability via the API before building anything.
+          RESP=$(curl -sSL -H "Authorization: Bearer $CATALOG_PAT" -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/sceriff0/flowpath-catalog)
+          PUSH=$(printf '%s' "$RESP" | jq -r '.permissions.push // false' 2>/dev/null || echo false)
+          if [ "$PUSH" != "true" ]; then
+            echo "::error::CATALOG_PAT cannot WRITE to sceriff0/flowpath-catalog (permissions.push=${PUSH}). Grant 'Contents: Read and write' on that repo (fine-grained PAT) or 'repo' scope (classic), then re-run." >&2
+            if [ "$EVENT_NAME" = "push" ]; then
+              echo "Deleting tag ${TAG} so a read-only secret leaves no dangling tag on an unreleased commit." >&2
+              git push --delete origin "$TAG" || echo "::warning::Could not delete tag ${TAG}; please remove it manually."
+            fi
+            exit 1
           fi
-          exit 1
+          echo "CATALOG_PAT is configured and can write to the catalog — release may proceed."
 
       # Guard 1: the version being released must match build.gradle.kts, so the
       # built JAR, the tag, and the catalog entry can never disagree.
