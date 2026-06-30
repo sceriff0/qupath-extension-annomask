@@ -1,71 +1,46 @@
 # FlowPath - AnnoMask
 
-A QuPath 0.7+ extension that converts labeled TIFF segmentation masks into
-QuPath detection objects (and GeoJSON) without leaving the app.
+[![QuPath](https://img.shields.io/badge/QuPath-%E2%89%A50.7.0-blue.svg)](https://qupath.github.io/)
+[![Java](https://img.shields.io/badge/Java-25-orange.svg)](https://jdk.java.net/25/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-flowpath.readthedocs.io-success.svg)](https://flowpath.readthedocs.io/)
 
-Useful after an external segmentation run (Cellpose, StarDist, mirage,
-custom pipelines) when all you have on disk is a labeled mask and you want
-detections that FlowPath-GatingTree can gate on.
+A QuPath 0.7+ extension that converts **labeled TIFF segmentation masks into
+QuPath detections** (and GeoJSON) without leaving the app — with optional
+per-channel intensity sampling. It's the import step for mask-based pipelines
+([MIRAGE](https://mirage-pipeline.readthedocs.io/), Cellpose, StarDist, custom) into the
+FlowPath toolkit.
 
-## What it does
-
-Given a labeled mask — a single-band integer raster where `0` is background
-and each positive value is a unique cell/region ID — AnnoMask traces the
-contour of every label and produces one QuPath `PathDetectionObject` per
-label, using QuPath's built-in `ContourTracing`.
-
-It can also:
-- Sample mean intensity per channel per detection (so downstream tools like
-  FlowPath-GatingTree see populated measurements and can gate immediately).
-  Intensity is computed with the same bincount pass mirage uses in
-  `bin/quantify.py` — values are identical, and measurements are keyed by
-  bare channel name (`CD45`, `DAPI`), which is what GatingTree and qUMAP
-  read.
-- Add the detections straight into the current image's hierarchy
-- Save the result as QuPath-native GeoJSON (`FeatureCollection`)
-
-One detection is produced per unique integer label in the mask. Labels with
-multiple connected components are merged into a single detection, matching
-mirage's cell count.
-
-## Two input modes
-
-1. **Channel in current image** — pick a channel whose pixel values are
-   integer labels. Useful when segmentation output is merged into the
-   OME-TIFF as an extra channel.
-2. **Load from file** — pick a labeled `.tif` / `.tiff` on disk. Assumed to
-   align to the current image's pixel grid.
+Part of the [FlowPath suite](https://flowpath.readthedocs.io/), alongside
+[GatingTree](https://github.com/sceriff0/qupath-extension-flowpath-gatingtree) and
+[qUMAP](https://github.com/sceriff0/qupath-extension-flowpath-qumap).
 
 ## Install
 
-Drop the release JAR into QuPath's extensions directory, or use the
-[FlowPath catalog](https://github.com/sceriff0/flowpath-catalog) via
-QuPath's extension manager and install "FlowPath - AnnoMask".
+In QuPath, add the FlowPath catalog and install **AnnoMask**:
 
-Open an image, then `Extensions → FlowPath - AnnoMask`
-(shortcut: `Ctrl+Shift+M` / `⌘⇧M`).
-
-## Build
-
-Requires JDK 25 and QuPath 0.7.0 artefacts. This project uses the standard
-`qupath-extension-settings` Gradle plugin, same as the other FlowPath
-extensions.
-
-```bash
-./gradlew build
+```
+https://raw.githubusercontent.com/sceriff0/flowpath-catalog/main/catalog.json
 ```
 
-JAR lands in `build/libs/`.
+(Extensions → Manage extensions → Manage extension catalogs → Add.) Launch with
+**Extensions → FlowPath - AnnoMask** (`Ctrl+Shift+M` / `⌘⇧M`). Full install
+options are in the [docs](https://flowpath.readthedocs.io/installation/).
 
-## How it relates to the rest of the FlowPath toolkit
+## Build from source
 
-- **FlowPath - GatingTree**: interactive phenotype gating. AnnoMask
-  produces the detections that GatingTree operates on.
-- **FlowPath - qUMAP**: UMAP over detection measurements. AnnoMask +
-  intensity extraction populates measurements for qUMAP to embed.
-- **mirage** (external Python pipeline): produces the labeled masks that
-  AnnoMask consumes. AnnoMask is the "import step" when you want mirage's
-  masks inside QuPath without running mirage's `export_geojson.py`.
+Requires JDK 25 and QuPath 0.7.0 artefacts.
+
+```bash
+git clone https://github.com/sceriff0/qupath-extension-annomask.git
+cd qupath-extension-annomask
+./gradlew build   # JAR lands in build/libs/ → drag onto QuPath
+```
+
+## 📖 Documentation
+
+Input modes, intensity sampling, how it fits the FlowPath workflow, and
+troubleshooting are all at **<https://flowpath.readthedocs.io/>**.
 
 ## License
 
